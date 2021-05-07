@@ -1,0 +1,233 @@
+#!/bin/sh
+
+#
+# DO NOT EDIT. Will be overwritten.
+#
+# sympayconsoleqa4.example.com
+#
+
+
+APP_NAME="sympayconsoleqa4"
+COMMON_PREFIX="/apps/qa4/deploy"
+APP_DEPLOYED_DIR="$COMMON_PREFIX/app/sympayconsole-tomcat"
+APP_LOG_PATH="/logs/qa4/sympayconsole/console-tomcat.log"
+APP_JVM_NAME="SymPaymentConsole"
+APP_LAUNCHER="startup_qa4.sh"
+RECPT=""
+
+
+# ---------------------------------------------------------------------------- #
+
+RESTARTER_DIR=`dirname $(realpath $0)`
+FINGERPRINT="$RESTARTER_DIR/___$(hostname)_$(cat /sys/class/net/$(/usr/sbin/ip route show default | awk '/default/ {print $5}')/address | sed -e 's/:/_/g')___"
+FATAL="${FINGERPRINT}.i_can_t_get_up"
+SLEEP_STATE="${FINGERPRINT}.sleep"
+PROCESSED="${FINGERPRINT}.done"
+
+MAX_SLEEP_TIME=150
+TRANQUILO_TIME=30
+PERM_DOWN_TIME="60*60*2"
+
+
+timestamp() {
+    date +"%Y-%m-%d %T"
+}
+
+start_service() {
+    (
+        export PATH=$(locate $HOME/CI_WORKSPACE/node-*/bin | head -n 1):$PATH
+        npm install pm2@latest -g 
+        pm2 update
+
+        cd $APP_DEPLOYED_DIR
+        pm2 stop $APP_NAME      || true
+        pm2 delete $APP_NAME    || true
+
+        echo "$(timestamp): @@@ $(pwd) @@@"
+        echo "$(timestamp): *** exec: [pm2 start --no-autorestart -n $APP_NAME --log $APP_LOG_PATH $APP_LAUNCHER] ***"
+        pm2 start --no-autorestart -n $APP_NAME --log $APP_LOG_PATH $APP_LAUNCHER
+
+        if [ ! -e $(basename $APP_LOG_PATH) ]; then
+            echo "$(timestamp): ... creating symlink ... "
+            ln -sf $APP_LOG_PATH  .
+        fi
+
+        sleep $TRANQUILO_TIME
+
+        if [ "$(PATH=$(locate $HOME/CI_WORKSPACE/node-*/bin | head -n 1):$PATH pm2 ls | grep -E 'errored|stopped')" ]; then
+            # i've tried but this isn't working 
+            _MESG_=$(cat <<EOF
+☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️
+FATAL ERROR! Unable to restart!!!
+☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️
+<code>
+$(PATH=$(locate $HOME/CI_WORKSPACE/node-*/bin | head -n 1):$PATH pm2 ls)
+</code>
+EOF
+)
+            send_notification "$_MESG_"
+            touch $FATAL
+        else
+            # restart worked
+            _MESG_=$(cat <<EOF
+✅ ... restarted! 👍
+
+<code>
+$(df -h)
+
+$(PATH=$(locate $HOME/CI_WORKSPACE/node-*/bin | head -n 1):$PATH pm2 ls)
+</code>
+EOF
+)
+            send_notification "$_MESG_"
+        fi
+    )
+}
+
+stop_service() {
+    echo "$(timestamp): @@@ [stop_service]: $(pwd) @@@"
+
+    (
+        export PATH=$(locate $HOME/CI_WORKSPACE/node-*/bin | head -n 1):$PATH 
+        pm2 stop $APP_NAME      || true
+        pm2 delete $APP_NAME    || true
+    )
+    sleep $((TRANQUILO_TIME/2))
+
+    echo "$(timestamp): stop_service ${APP_NAME} pid: [$(app_pid)]"
+}
+
+app_pid() {
+    echo "$(ps aux | grep java | grep -v grep | grep $COMMON_PREFIX | grep $APP_JVM_NAME | awk '{print $2}')"
+}
+
+app_is_running() {
+    [ ! -z "$(app_pid)" ]
+}
+
+send_notification() {
+    echo "$1" |  mail -s "RESTARTER - $(hostname)" -r ""  -B  $RECPT
+
+    [ $RESTARTER_WEBHOOK_PAYMENTS ] && curl -H "Content-Type: application/json" -d "{\"text\": \"$1\"}" $RESTARTER_WEBHOOK_PAYMENTS
+}
+
+#
+# main
+#
+echo "$(timestamp): ::: PWD:$PWD || RESTARTER_DIR:$RESTARTER_DIR || FINGERPRINT:$FINGERPRINT :::"
+
+while [ 1 ]; do
+    sleep $TRANQUILO_TIME
+
+    # in stuck state?
+    if [ -f "$FATAL" ]; then
+        echo "$(timestamp): * In [FATAL] state ... "
+
+        # is app running?
+        if app_is_running; then
+            # we're no longer down, cleanup stale file
+            echo "$(timestamp): ... APP is up. End of [FATAL]."
+            rm -f "$SLEEP_STATE" "$FATAL"
+            send_notification "✅ [$APP_NAME / $(hostname)] which was previously stuck is back 👍"
+        else
+            # still down. Instead of sleep $PERM_DOWN_TIME, we'll go into 'SLEEP' state while still 
+            # periodically polling app status
+            echo "$(timestamp): ... APP is not up. [FATAL] going to [SLEEP]."
+            [[ -e $SLEEP_STATE ]] || touch $SLEEP_STATE
+        fi
+    fi
+    # end if fatal stuck
+
+    # in sleep state?
+    if [ -f "$SLEEP_STATE" ]; then
+        echo "$(timestamp): ** In [SLEEP] state ... "
+
+        # in sleep window?
+        if [ $(($(date +%s) - $(stat --printf=%Y "$SLEEP_STATE"))) -lt $(($PERM_DOWN_TIME)) ]; then
+            # still within sleep window
+            if app_is_running; then
+                # yes => send out notification and snap out of sleep
+                echo "$(timestamp): ... within [SLEEP] window. APP is up. End of [SLEEP]."
+                rm -f "$SLEEP_STATE" "$FATAL"
+                send_notification "✅ [$APP_NAME / $(hostname)] which was previously stuck is back 👍"
+            else
+                # no. still stuck so go back into sleep state
+                echo "$(timestamp): ... within [SLEEP] window. APP still down. [SLEEP]ing ..."
+                sleep $MAX_SLEEP_TIME
+            fi
+        else
+            # outside of sleep window. check if app is running?
+            if app_is_running; then
+                # yes => send out notification and snap out of sleep
+                echo "$(timestamp): ... outside [SLEEP] window. APP is up. End of [SLEEP]."
+                rm -f "$SLEEP_STATE" "$FATAL"
+                send_notification "✅ [$APP_NAME / $(hostname)] which was previously stuck is back 👍"
+            else
+                # no => still down. send out notification and extend sleep
+                echo "$(timestamp): ... outside [SLEEP] window. APP still down. Extending [SLEEP] ..."
+                _MESG_=$(cat <<EOF
+☢️  ☢️  ☢️  ☢️  ☢️  ☢️  ☢️  ☢️  ☢️  ☢️  ☢️  ☢️  ☢️  ☢️  ☢️  ☢️  ☢️  ☢️  ☢️  ☢️  ☢️  ☢️  
+!!! WARN !!! !!! WARN !!! !!! WARN !!! !!! WARN !!! !!! WARN !!! 
+
+$APP_NAME / $(hostname) has been down since:
+$(stat -c %y $FATAL | cut -d'.' -f1)
+
+!!! WARN !!! !!! WARN !!! !!! WARN !!! !!! WARN !!! !!! WARN !!!
+☢️  ☢️  ☢️  ☢️  ☢️  ☢️  ☢️  ☢️  ☢️  ☢️  ☢️  ☢️  ☢️  ☢️  ☢️  ☢️  ☢️  ☢️  ☢️  ☢️  ☢️  ☢️ 
+EOF
+)
+                send_notification "$_MESG_"
+                touch "$SLEEP_STATE"
+            fi
+        fi
+    else
+        echo "$(timestamp): ** Not in [SLEEP] state ..."
+
+        # is app running? if not, wake it up
+        if ! app_is_running; then
+            # backoff
+            echo "$(timestamp): %%% APP is not running. backing off for $MAX_SLEEP_TIME sec %%% "
+            sleep $MAX_SLEEP_TIME
+
+            # check again
+            if ! app_is_running; then
+                # app is definitely down
+                echo "$(timestamp): @@@ APP is down ..."
+                send_notification "❌ [$APP_NAME / $(hostname)] was down! Restarting ..."
+                touch $FINGERPRINT
+            fi
+        fi
+    fi
+    # end if sleep
+
+    # fingerprint?
+    if [ -f "$FINGERPRINT" ]; then
+        echo "$(timestamp): @@@ pending restart request @@@ "
+
+        if ! app_is_running; then
+            echo "$(timestamp): ... attempting [start_service]"
+            
+            start_service
+        else
+            echo "$(timestamp): ... attempting [stop_service] => [start_service]"
+            send_notification "🔔🔔🔔 [$APP_NAME / $(hostname)] APP RESTART requested 🔔🔔🔔"
+
+            stop_service
+            start_service
+        fi
+
+        # request processed
+        mv $FINGERPRINT $PROCESSED
+        touch $PROCESSED
+
+        sleep $TRANQUILO_TIME
+    else
+        echo "$(timestamp): ::: nothing to be done. Going to sleep ::: "
+
+        sleep $MAX_SLEEP_TIME
+    fi
+    # end if fingerprint
+
+done
+
+# ---------------------------------------------------------------------------- #
